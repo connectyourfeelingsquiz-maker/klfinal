@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: klfinal-backend
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: "git lfs pull || true; pip install -r backend/requirements.txt"
+    startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MODEL_DIR
+        value: ../models

@@ -1,0 +1,35 @@
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Python virtual environments & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+
+# Node & Frontend dependencies
+node_modules/
+dist/
+dist-ssr/
+.npm
+*.log
+
+# Sensitive environment variables (keep .env.example)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Temporary and IDE caches
+.vscode/
+.idea/
+*.swp
+*.swo
