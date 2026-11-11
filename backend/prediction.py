@@ -37,15 +37,98 @@ class ModelService:
         self.lottery_names: List[str] = []
         self._is_loaded = False
 
-    def _verify_not_lfs_pointer(self, path: Path, filename: str) -> None:
+    def _get_writable_target(self, filename: str) -> Path:
+        """Returns a writable destination path (handles read-only serverless filesystems)."""
+        candidate_dirs = [
+            self.base_dir / "models",
+            Path("/tmp/models"),
+            Path("/tmp")
+        ]
+        for d in candidate_dirs:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                test_file = d / f".write_test_{os.getpid()}"
+                test_file.touch()
+                test_file.unlink()
+                return d / filename
+            except (OSError, PermissionError):
+                continue
+        return Path("/tmp") / filename
+
+    def _download_binary_file(self, url: str, target: Path, filename: str) -> Path:
+        """
+        Streams a large model binary from external URL (GitHub Releases, S3, GCS, R2)
+        with custom User-Agent, chunked streaming, redirect handling, and validation.
+        """
+        print(f"[ModelService] Downloading binary model from: {url}")
+        print(f"[ModelService] Destination path: {target}")
+        
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_target = target.with_suffix(".download.tmp")
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        req = urllib.request.Request(url, headers=headers)
+        
+        try:
+            with urllib.request.urlopen(req, timeout=180) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" in content_type:
+                    preview = response.read(250).decode("utf-8", errors="ignore")
+                    raise RuntimeError(
+                        f"Download URL returned an HTML page instead of a binary file. "
+                        f"Ensure you provided a direct download link (e.g. GitHub Releases direct asset link). "
+                        f"Response preview: {preview[:120]}..."
+                    )
+                
+                downloaded_bytes = 0
+                chunk_size = 1024 * 1024  # 1MB buffer
+                with open(temp_target, "wb") as out_f:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes % (25 * 1024 * 1024) == 0:
+                            print(f"[ModelService] Downloaded {downloaded_bytes // (1024 * 1024)} MB...")
+                
+                # Check for Git LFS pointer or invalid small file (< 1MB)
+                if downloaded_bytes < 1024 * 1024:
+                    with open(temp_target, "rb") as check_f:
+                        content_sample = check_f.read(200)
+                    if b"version https://git-lfs" in content_sample:
+                        raise RuntimeError(
+                            f"Downloaded file from {url} is a Git LFS pointer text file ({downloaded_bytes} bytes), "
+                            f"not the actual binary model. Download direct release assets instead of raw Git blob links."
+                        )
+                    raise RuntimeError(
+                        f"Downloaded file is suspiciously small ({downloaded_bytes} bytes). Expected binary model > 90 MB."
+                    )
+                
+                if target.exists():
+                    target.unlink()
+                temp_target.rename(target)
+                print(f"[ModelService] Successfully saved '{filename}' ({target.stat().st_size} bytes) to {target}")
+                return target
+        except Exception as e:
+            if temp_target.exists():
+                try:
+                    temp_target.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Failed to download model binary from {url}: {e}") from e
+
+    def _verify_not_lfs_pointer(self, path: Path, filename: str) -> Path:
         """
         Detects if a model file is only a Git LFS pointer instead of actual binary.
         If a remote download URL is provided in environment variables, downloads it.
+        Returns the resolved binary model path.
         """
         if not path.exists():
-            return
+            return path
 
-        # Check file size: Git LFS pointer files are typically ~130 bytes
         file_size = path.stat().st_size
         if file_size < 1024:
             try:
@@ -53,34 +136,34 @@ class ModelService:
                     header = f.read(50)
                 if b"version https://git-lfs" in header:
                     print(f"[ModelService WARNING] '{filename}' is a Git LFS pointer text file ({file_size} bytes), not the binary model!")
-                    # Check for remote download URL in environment
                     env_var_key = "MODEL_KL1_URL" if "joblib" in filename else "MODEL_KLED2_URL"
                     download_url = os.environ.get(env_var_key) or os.environ.get("MODEL_STORAGE_URL")
                     if download_url:
-                        print(f"[ModelService] Downloading actual model from {env_var_key} to {path}...")
-                        urllib.request.urlretrieve(download_url, str(path))
-                        print(f"[ModelService] Download complete ({path.stat().st_size} bytes).")
-                        return
+                        target = self._get_writable_target(filename)
+                        return self._download_binary_file(download_url, target, filename)
 
                     raise RuntimeError(
                         f"Model file '{filename}' at {path} is an unpulled Git LFS pointer ({file_size} bytes). "
-                        f"During deployment on Render, run 'git lfs pull' in your build command or configure the "
-                        f"'{env_var_key}' environment variable pointing to external cloud storage (S3 / GCS / GitHub Release)."
+                        f"On serverless hosts like Vercel, configure '{env_var_key}' environment variable pointing to "
+                        f"your GitHub Release direct download URL or Cloud Storage bucket."
                     )
             except Exception as e:
                 if isinstance(e, RuntimeError):
                     raise
                 print(f"[ModelService] Could not check LFS header: {e}")
+        return path
 
     def _resolve_model_path(self, filename: str) -> Path:
-        """Find model file across candidate paths including root, models/, and cwd."""
+        """Find model file across candidate paths including root, models/, /tmp, and cwd."""
         model_env = os.environ.get("MODEL_DIR")
         candidates = [
             self.base_dir / "models" / filename,
             self.base_dir / filename,
+            Path("/tmp/models") / filename,
+            Path("/tmp") / filename,
             Path.cwd() / "models" / filename,
             Path.cwd().parent / "models" / filename,
-            Path("/app/models") / filename,  # Render container standard
+            Path("/app/models") / filename,  # Container standard
             Path(model_env).resolve() / filename if model_env else None,
             Path.cwd() / filename,
         ]
@@ -88,19 +171,15 @@ class ModelService:
         valid_candidates = [p for p in candidates if p is not None]
         for p in valid_candidates:
             if p.exists() and p.is_file():
-                self._verify_not_lfs_pointer(p, filename)
-                return p
+                actual_path = self._verify_not_lfs_pointer(p, filename)
+                return actual_path
 
-        # Check if environment URL is provided to download into default models/ path
-        target_dir = self.base_dir / "models"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_file = target_dir / filename
+        # If not found locally, check if remote URL is provided in environment
         env_var_key = "MODEL_KL1_URL" if "joblib" in filename else "MODEL_KLED2_URL"
         download_url = os.environ.get(env_var_key)
         if download_url:
-            print(f"[ModelService] Model missing locally. Downloading {filename} from {download_url}...")
-            urllib.request.urlretrieve(download_url, str(target_file))
-            return target_file
+            target_file = self._get_writable_target(filename)
+            return self._download_binary_file(download_url, target_file, filename)
 
         raise FileNotFoundError(
             f"Model file '{filename}' not found in candidates: {[str(c) for c in valid_candidates]}. "

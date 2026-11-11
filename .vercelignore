@@ -1,0 +1,11 @@
+# Vercel deployment ignore file for Python Backend
+frontend/
+node_modules/
+.git/
+final.csv
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+

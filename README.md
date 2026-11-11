@@ -191,41 +191,46 @@ Vite is pre-configured with a reverse proxy forwarding `/api` requests to `http:
 
 ## 🌐 Production Deployment
 
-### 1. Deploying Backend to Render
+### 1. Deploying Backend to Vercel (FastAPI Serverless)
 
-Render hosts the Python FastAPI inference service.
+Vercel hosts the backend as an ASGI Python Serverless Function via [`vercel.json`](vercel.json) and [`api/index.py`](api/index.py).
 
-#### Model Storage Consideration (GitHub 100MB File Limit)
-`kerala_lottery_model.joblib` is ~241 MB. Standard GitHub rejects individual files larger than 100 MB. To push your repository to GitHub:
+#### ⚠️ Critical Vercel Serverless Limitations & Workarounds
+1. **250 MB Package Limit**:
+   - Vercel enforces a strict **250 MB uncompressed size limit** on each Serverless Function.
+   - Bundling both trained models (KL1 is 241 MB, KLED2 is 100 MB) alongside Python dependencies (~150 MB) totals **~491 MB**, which will fail Vercel deployment if uploaded directly.
+   - **Solution**: [`models/`](models/) is excluded from Vercel function packaging via [`.vercelignore`](.vercelignore). During cold-start initialization, the backend automatically streams the models into `/tmp/models` if `MODEL_KL1_URL` and `MODEL_KLED2_URL` are provided in Vercel's Environment Variables.
+2. **Execution Timeout**:
+   - Vercel Hobby plan has a 10s–15s maximum execution timeout. Host your model files on a high-speed CDN (such as AWS S3, Cloudflare R2, Google Cloud Storage, or GitHub Release assets) so initial streaming stays within the threshold.
+3. **Memory Limits**:
+   - Vercel provides 1024 MB (1 GB) memory on Hobby plans, which comfortably accommodates both unpickled Scikit-Learn tree ensembles (~500 MB RAM).
 
-1. **Option A: Use Git LFS (Recommended)**
-   ```bash
-   git lfs install
-   git lfs track "*.joblib" "*.pkl"
-   git add .gitattributes models/
-   git commit -m "Add model binaries with Git LFS"
-   git push origin main
-   ```
-2. **Option B: Cloud Object Storage (S3 / Cloud Storage / Render Disk)**
-   Upload `kerala_lottery_model.joblib` and `kerala_lottery_model.pkl` to an S3 or Google Cloud Storage bucket. On container startup, download them into `/app/models`.
-
-#### Steps on Render:
-1. Log in to [Render.com](https://render.com).
-2. Click **New +** -> **Web Service**.
-3. Connect your GitHub repository.
-4. Select **Docker** (using `backend/Dockerfile`) or **Python**:
-   - **Root Directory**: `.`
-   - **Build Command**: `pip install -r backend/requirements.txt`
-   - **Start Command**: `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Set Environment Variables:
-   - `MODEL_DIR`: `../models`
-   - `PYTHON_VERSION`: `3.11.9`
-6. Click **Deploy Web Service**.
-7. Copy your assigned Render URL (e.g. `https://klfinal-backend.onrender.com`).
+#### Steps to Deploy Backend on Vercel:
+1. Upload your model files (`kerala_lottery_model.joblib` and `kerala_lottery_model.pkl`) to an S3 bucket, Cloudflare R2, Google Cloud Storage, or a GitHub Release asset download link.
+2. Log in to [Vercel.com](https://vercel.com) and click **Add New...** -> **Project**.
+3. Import your GitHub repository.
+4. Set the **Framework Preset** to **Other** (Root directory: `.`).
+5. In **Environment Variables**, add:
+   - `MODEL_KL1_URL`: Direct download URL for `kerala_lottery_model.joblib`
+   - `MODEL_KLED2_URL`: Direct download URL for `kerala_lottery_model.pkl`
+6. Click **Deploy**.
+7. Copy your assigned Vercel URL (e.g., `https://klfinal-backend.vercel.app`).
 
 ---
 
-### 2. Deploying Frontend to Netlify
+### 2. Deploying Backend to Render (Alternative: Long-Running Container)
+
+Render is recommended if you prefer persistent server instances without serverless cold-start timeouts or package size limits.
+- Root Directory: `.`
+- Build Command: `git lfs pull || true; pip install -r backend/requirements.txt`
+- Start Command: `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Environment Variables:
+  - `MODEL_DIR`: `../models`
+  - `PYTHON_VERSION`: `3.11.9`
+
+---
+
+### 3. Deploying Frontend to Netlify (React + Vite)
 
 Netlify hosts the high-performance React + Vite static bundle.
 
@@ -239,10 +244,10 @@ Netlify hosts the high-performance React + Vite static bundle.
    - **Publish directory**: `dist` (or `frontend/dist`)
 5. In **Environment variables**, add:
    - **Key**: `VITE_API_URL`
-   - **Value**: `https://klfinal-backend.onrender.com` (Your Render backend URL)
+   - **Value**: `https://klfinal-backend.vercel.app` (Your Vercel backend URL)
 6. Click **Deploy Site**.
 
-`frontend/netlify.toml` automatically handles SPA routing and redirects.
+`netlify.toml` automatically handles SPA routing and redirects.
 
 ---
 
