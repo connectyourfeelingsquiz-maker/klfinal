@@ -118,12 +118,17 @@ def root():
 
 @app.get("/api/health")
 def health_check():
-    """Health check endpoint indicating model load status."""
-    return {
-        "status": "healthy",
+    """Health check endpoint indicating model load status and diagnostics."""
+    result = {
+        "status": "healthy" if service._is_loaded else "degraded",
         "models_loaded": service._is_loaded,
-        "lotteries_count": len(service.lottery_names)
+        "lotteries_count": len(service.lottery_names),
     }
+    if service._load_error:
+        result["load_error"] = service._load_error
+    if service._diagnostics:
+        result["diagnostics"] = service._diagnostics
+    return result
 
 
 @app.get("/api/lotteries")

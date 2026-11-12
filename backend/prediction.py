@@ -2,14 +2,21 @@
 KLFINAL Prediction Engine
 Loads the trained KL1 (joblib) and KLED2 (pkl) models and executes
 their original feature engineering and prediction pipelines.
+
+Vercel-optimized: Sequential download → hash verify → load → delete
+to stay within 512 MB /tmp disk limit.
 """
 
+import gc
+import hashlib
 import os
+import shutil
 import sys
+import time
 import urllib.request
 import itertools
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 import joblib
@@ -24,6 +31,37 @@ try:
 except Exception:
     pass
 
+# Expected SHA256 hashes for model integrity verification
+EXPECTED_HASHES = {
+    "kerala_lottery_model.joblib": "cee51bf857681aba4d5db5dcf29af2fdb17af46443e4939aec27532606d250db",
+    "kerala_lottery_model.pkl": "878dfd55b2f5045aa39a6386cfbb6ade4d87d72c18b505935c9352cb8704ad3c",
+}
+
+
+def _disk_space_info(path: str = "/tmp") -> Dict[str, str]:
+    """Returns human-readable disk space for the given path."""
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "total_mb": f"{usage.total / (1024 * 1024):.1f}",
+            "used_mb": f"{usage.used / (1024 * 1024):.1f}",
+            "free_mb": f"{usage.free / (1024 * 1024):.1f}",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _sha256_file(path: Path) -> str:
+    """Computes SHA256 hex digest of a file, streaming 1 MB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
 
 class ModelService:
     def __init__(self, base_dir: Path | None = None):
@@ -31,59 +69,86 @@ class ModelService:
             # Backend is at E:/klfinal/backend, project root is E:/klfinal
             base_dir = Path(__file__).resolve().parent.parent
         self.base_dir = Path(base_dir)
-        
+
         self.kl1_pkg: Dict[str, Any] | None = None
         self.kled2_pkg: Dict[str, Any] | None = None
         self.lottery_names: List[str] = []
         self._is_loaded = False
+        self._load_error: Optional[str] = None
+        self._diagnostics: Dict[str, Any] = {}
 
-    def _get_writable_target(self, filename: str) -> Path:
-        """Returns a writable destination path (handles read-only serverless filesystems)."""
-        candidate_dirs = [
+    # ------------------------------------------------------------------
+    # File-system helpers
+    # ------------------------------------------------------------------
+
+    def _get_writable_dir(self) -> Path:
+        """Returns the first writable directory."""
+        candidates = [
             self.base_dir / "models",
             Path("/tmp/models"),
-            Path("/tmp")
+            Path("/tmp"),
         ]
-        for d in candidate_dirs:
+        for d in candidates:
             try:
                 d.mkdir(parents=True, exist_ok=True)
                 test_file = d / f".write_test_{os.getpid()}"
                 test_file.touch()
                 test_file.unlink()
-                return d / filename
+                return d
             except (OSError, PermissionError):
                 continue
-        return Path("/tmp") / filename
+        return Path("/tmp")
+
+    # ------------------------------------------------------------------
+    # Download with diagnostics
+    # ------------------------------------------------------------------
 
     def _download_binary_file(self, url: str, target: Path, filename: str) -> Path:
         """
-        Streams a large model binary from external URL (GitHub Releases, S3, GCS, R2)
-        with custom User-Agent, chunked streaming, redirect handling, and validation.
+        Streams a large model binary from external URL with:
+        - Custom User-Agent to bypass GitHub asset CDN browser checks
+        - Chunked streaming (1 MB)
+        - Redirect following (urllib default)
+        - Git LFS pointer detection
+        - Size validation
+        - SHA256 hash verification
         """
-        print(f"[ModelService] Downloading binary model from: {url}")
-        print(f"[ModelService] Destination path: {target}")
-        
+        print(f"[ModelService] Downloading '{filename}' from: {url}")
+        print(f"[ModelService] Target: {target}")
+        print(f"[ModelService] Disk before download: {_disk_space_info(str(target.parent))}")
+
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_target = target.with_suffix(".download.tmp")
-        
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/octet-stream",
         }
         req = urllib.request.Request(url, headers=headers)
-        
+
         try:
-            with urllib.request.urlopen(req, timeout=180) as response:
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=300) as response:
                 content_type = response.headers.get("Content-Type", "")
+                content_length = response.headers.get("Content-Length", "unknown")
+                final_url = response.url  # after redirects
+                print(f"[ModelService] Final URL: {final_url}")
+                print(f"[ModelService] Content-Type: {content_type}, Content-Length: {content_length}")
+
                 if "text/html" in content_type:
                     preview = response.read(250).decode("utf-8", errors="ignore")
                     raise RuntimeError(
-                        f"Download URL returned an HTML page instead of a binary file. "
-                        f"Ensure you provided a direct download link (e.g. GitHub Releases direct asset link). "
-                        f"Response preview: {preview[:120]}..."
+                        f"Download URL returned HTML instead of binary. "
+                        f"Use a direct download link (e.g. GitHub Releases asset URL). "
+                        f"Preview: {preview[:120]}..."
                     )
-                
+
                 downloaded_bytes = 0
-                chunk_size = 1024 * 1024  # 1MB buffer
+                chunk_size = 1024 * 1024  # 1 MB
                 with open(temp_target, "wb") as out_f:
                     while True:
                         chunk = response.read(chunk_size)
@@ -91,70 +156,77 @@ class ModelService:
                             break
                         out_f.write(chunk)
                         downloaded_bytes += len(chunk)
-                        if downloaded_bytes % (25 * 1024 * 1024) == 0:
-                            print(f"[ModelService] Downloaded {downloaded_bytes // (1024 * 1024)} MB...")
-                
-                # Check for Git LFS pointer or invalid small file (< 1MB)
-                if downloaded_bytes < 1024 * 1024:
-                    with open(temp_target, "rb") as check_f:
-                        content_sample = check_f.read(200)
-                    if b"version https://git-lfs" in content_sample:
-                        raise RuntimeError(
-                            f"Downloaded file from {url} is a Git LFS pointer text file ({downloaded_bytes} bytes), "
-                            f"not the actual binary model. Download direct release assets instead of raw Git blob links."
-                        )
+                        if downloaded_bytes % (50 * 1024 * 1024) < chunk_size:
+                            elapsed = time.time() - t0
+                            print(
+                                f"[ModelService] ... {downloaded_bytes / (1024 * 1024):.1f} MB "
+                                f"({elapsed:.1f}s)"
+                            )
+
+            elapsed = time.time() - t0
+            print(
+                f"[ModelService] Download complete: {downloaded_bytes:,} bytes "
+                f"in {elapsed:.1f}s"
+            )
+
+            # ---- Validate downloaded file ----
+            # 1. LFS pointer check
+            if downloaded_bytes < 1024 * 1024:
+                with open(temp_target, "rb") as f:
+                    sample = f.read(200)
+                if b"version https://git-lfs" in sample:
+                    temp_target.unlink(missing_ok=True)
                     raise RuntimeError(
-                        f"Downloaded file is suspiciously small ({downloaded_bytes} bytes). Expected binary model > 90 MB."
+                        f"Downloaded file is a Git LFS pointer ({downloaded_bytes} bytes), "
+                        f"NOT the binary model. Upload the actual model binary as a "
+                        f"GitHub Release asset—do not use raw Git blob URLs."
                     )
-                
-                if target.exists():
-                    target.unlink()
-                temp_target.rename(target)
-                print(f"[ModelService] Successfully saved '{filename}' ({target.stat().st_size} bytes) to {target}")
-                return target
+                temp_target.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Downloaded file is too small ({downloaded_bytes} bytes). "
+                    f"Expected >90 MB binary model."
+                )
+
+            # 2. SHA256 hash verification
+            actual_hash = _sha256_file(temp_target)
+            expected_hash = (
+                os.environ.get(
+                    "MODEL_KL1_SHA256" if "joblib" in filename else "MODEL_KLED2_SHA256"
+                )
+                or EXPECTED_HASHES.get(filename)
+            )
+            if expected_hash and actual_hash != expected_hash:
+                temp_target.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"SHA256 mismatch for '{filename}'!\n"
+                    f"  Expected: {expected_hash}\n"
+                    f"  Got:      {actual_hash}\n"
+                    f"The download may be corrupted, truncated, or an LFS pointer page."
+                )
+            print(f"[ModelService] SHA256 verified: {actual_hash}")
+
+            # Move temp → final
+            if target.exists():
+                target.unlink()
+            temp_target.rename(target)
+            print(f"[ModelService] Saved '{filename}': {target.stat().st_size:,} bytes")
+            print(f"[ModelService] Disk after download: {_disk_space_info(str(target.parent))}")
+            return target
+
         except Exception as e:
             if temp_target.exists():
                 try:
                     temp_target.unlink()
                 except Exception:
                     pass
-            raise RuntimeError(f"Failed to download model binary from {url}: {e}") from e
+            raise RuntimeError(f"Failed to download '{filename}' from {url}: {e}") from e
 
-    def _verify_not_lfs_pointer(self, path: Path, filename: str) -> Path:
-        """
-        Detects if a model file is only a Git LFS pointer instead of actual binary.
-        If a remote download URL is provided in environment variables, downloads it.
-        Returns the resolved binary model path.
-        """
-        if not path.exists():
-            return path
+    # ------------------------------------------------------------------
+    # Resolve a single model: local file or remote download
+    # ------------------------------------------------------------------
 
-        file_size = path.stat().st_size
-        if file_size < 1024:
-            try:
-                with open(path, "rb") as f:
-                    header = f.read(50)
-                if b"version https://git-lfs" in header:
-                    print(f"[ModelService WARNING] '{filename}' is a Git LFS pointer text file ({file_size} bytes), not the binary model!")
-                    env_var_key = "MODEL_KL1_URL" if "joblib" in filename else "MODEL_KLED2_URL"
-                    download_url = os.environ.get(env_var_key) or os.environ.get("MODEL_STORAGE_URL")
-                    if download_url:
-                        target = self._get_writable_target(filename)
-                        return self._download_binary_file(download_url, target, filename)
-
-                    raise RuntimeError(
-                        f"Model file '{filename}' at {path} is an unpulled Git LFS pointer ({file_size} bytes). "
-                        f"On serverless hosts like Vercel, configure '{env_var_key}' environment variable pointing to "
-                        f"your GitHub Release direct download URL or Cloud Storage bucket."
-                    )
-            except Exception as e:
-                if isinstance(e, RuntimeError):
-                    raise
-                print(f"[ModelService] Could not check LFS header: {e}")
-        return path
-
-    def _resolve_model_path(self, filename: str) -> Path:
-        """Find model file across candidate paths including root, models/, /tmp, and cwd."""
+    def _find_local_model(self, filename: str) -> Optional[Path]:
+        """Searches local candidate directories for a real binary model file."""
         model_env = os.environ.get("MODEL_DIR")
         candidates = [
             self.base_dir / "models" / filename,
@@ -163,51 +235,158 @@ class ModelService:
             Path("/tmp") / filename,
             Path.cwd() / "models" / filename,
             Path.cwd().parent / "models" / filename,
-            Path("/app/models") / filename,  # Container standard
-            Path(model_env).resolve() / filename if model_env else None,
-            Path.cwd() / filename,
+            Path("/app/models") / filename,
         ]
-        
-        valid_candidates = [p for p in candidates if p is not None]
-        for p in valid_candidates:
-            if p.exists() and p.is_file():
-                actual_path = self._verify_not_lfs_pointer(p, filename)
-                return actual_path
+        if model_env:
+            candidates.append(Path(model_env).resolve() / filename)
+        candidates.append(Path.cwd() / filename)
 
-        # If not found locally, check if remote URL is provided in environment
-        env_var_key = "MODEL_KL1_URL" if "joblib" in filename else "MODEL_KLED2_URL"
-        download_url = os.environ.get(env_var_key)
-        if download_url:
-            target_file = self._get_writable_target(filename)
-            return self._download_binary_file(download_url, target_file, filename)
+        for p in candidates:
+            if p is not None and p.exists() and p.is_file():
+                size = p.stat().st_size
+                # Detect Git LFS pointer
+                if size < 1024:
+                    try:
+                        with open(p, "rb") as f:
+                            header = f.read(50)
+                        if b"version https://git-lfs" in header:
+                            print(
+                                f"[ModelService WARNING] '{p}' is an LFS pointer "
+                                f"({size} bytes) — skipping."
+                            )
+                            continue
+                    except Exception:
+                        pass
+                return p
+        return None
 
-        raise FileNotFoundError(
-            f"Model file '{filename}' not found in candidates: {[str(c) for c in valid_candidates]}. "
-            f"Set MODEL_DIR or {env_var_key} environment variable."
-        )
+    def _resolve_and_load_single_model(
+        self, filename: str, env_url_key: str
+    ) -> Any:
+        """
+        Resolves, downloads (if needed), loads into memory, and deletes the
+        temp file for a single model.  Returns the deserialized model package.
+
+        This keeps at most ONE model binary on disk at a time, critical for
+        Vercel's 512 MB /tmp limit.
+        """
+        t0 = time.time()
+
+        # 1. Try local path first (works in dev and container deployments)
+        local_path = self._find_local_model(filename)
+        if local_path:
+            print(f"[ModelService] Found local '{filename}': {local_path} ({local_path.stat().st_size:,} bytes)")
+            # Verify hash for local files too
+            actual_hash = _sha256_file(local_path)
+            expected_hash = EXPECTED_HASHES.get(filename)
+            if expected_hash and actual_hash != expected_hash:
+                print(
+                    f"[ModelService WARNING] Local hash mismatch for '{filename}':\n"
+                    f"  Expected: {expected_hash}\n"
+                    f"  Got:      {actual_hash}\n"
+                    f"  Loading anyway (model may have been retrained)."
+                )
+            else:
+                print(f"[ModelService] Local SHA256 OK: {actual_hash}")
+            pkg = joblib.load(local_path)
+            elapsed = time.time() - t0
+            print(f"[ModelService] Loaded '{filename}' from local in {elapsed:.1f}s")
+            return pkg
+
+        # 2. Remote download (Vercel / serverless)
+        download_url = os.environ.get(env_url_key)
+        if not download_url:
+            raise FileNotFoundError(
+                f"Model file '{filename}' not found locally and no download URL "
+                f"configured.  Set the '{env_url_key}' environment variable to a "
+                f"direct binary download URL (e.g. GitHub Releases asset)."
+            )
+
+        writable_dir = self._get_writable_dir()
+        target = writable_dir / filename
+        downloaded_path = self._download_binary_file(download_url, target, filename)
+
+        # Load into memory
+        print(f"[ModelService] Loading '{filename}' into memory...")
+        pkg = joblib.load(downloaded_path)
+        elapsed_load = time.time() - t0
+        print(f"[ModelService] Loaded '{filename}' in {elapsed_load:.1f}s total")
+
+        # Delete temp file to free /tmp disk for the next model
+        try:
+            downloaded_path.unlink()
+            print(
+                f"[ModelService] Deleted temp file '{downloaded_path}' to free disk. "
+                f"Disk now: {_disk_space_info(str(writable_dir))}"
+            )
+        except Exception as e:
+            print(f"[ModelService WARNING] Could not delete temp file: {e}")
+
+        # Force a garbage collection to release any file-backed memory maps
+        gc.collect()
+
+        return pkg
+
+    # ------------------------------------------------------------------
+    # Public model loading
+    # ------------------------------------------------------------------
 
     def load_models(self) -> None:
-        """Loads both ML models once into memory."""
+        """
+        Loads both ML models into memory.
+
+        On serverless (Vercel) the strategy is:
+          1. Download KL1 → verify hash → load → delete temp file
+          2. Download KLED2 → verify hash → load → delete temp file
+        This avoids having both 241 MB + 100 MB on /tmp simultaneously.
+        """
         if self._is_loaded:
             return
 
-        kl1_path = self._resolve_model_path("kerala_lottery_model.joblib")
-        kled2_path = self._resolve_model_path("kerala_lottery_model.pkl")
+        self._load_error = None
+        self._diagnostics = {"load_start": time.time()}
 
-        print(f"[ModelService] Loading KL1 model from: {kl1_path} ({kl1_path.stat().st_size} bytes)")
-        self.kl1_pkg = joblib.load(kl1_path)
+        print(f"[ModelService] base_dir = {self.base_dir}")
+        print(f"[ModelService] Disk at start: {_disk_space_info('/tmp')}")
 
-        print(f"[ModelService] Loading KLED2 model from: {kled2_path} ({kled2_path.stat().st_size} bytes)")
-        self.kled2_pkg = joblib.load(kled2_path)
+        try:
+            # ---- KL1 (241 MB) — load first, delete temp, THEN load KLED2 ----
+            self.kl1_pkg = self._resolve_and_load_single_model(
+                "kerala_lottery_model.joblib", "MODEL_KL1_URL"
+            )
+            if not isinstance(self.kl1_pkg, dict) or "models" not in self.kl1_pkg:
+                raise RuntimeError(
+                    "KL1 model loaded but has unexpected structure "
+                    f"(type={type(self.kl1_pkg).__name__}, "
+                    f"keys={list(self.kl1_pkg.keys()) if isinstance(self.kl1_pkg, dict) else 'N/A'}). "
+                    "Expected dict with 'models' key."
+                )
+
+            # ---- KLED2 (100 MB) ----
+            self.kled2_pkg = self._resolve_and_load_single_model(
+                "kerala_lottery_model.pkl", "MODEL_KLED2_URL"
+            )
+            if not isinstance(self.kled2_pkg, dict) or "models" not in self.kled2_pkg:
+                raise RuntimeError(
+                    "KLED2 model loaded but has unexpected structure "
+                    f"(type={type(self.kled2_pkg).__name__}, "
+                    f"keys={list(self.kled2_pkg.keys()) if isinstance(self.kled2_pkg, dict) else 'N/A'}). "
+                    "Expected dict with 'models' key."
+                )
+
+        except Exception as e:
+            self._load_error = str(e)
+            self._is_loaded = False
+            self.kl1_pkg = None
+            self.kled2_pkg = None
+            print(f"[ModelService ERROR] Model loading failed: {e}")
+            raise
 
         # Extract lottery names from both models
         kl1_lotteries = set(self.kl1_pkg.get("lottery_names", []))
         kled2_lotteries = set(self.kled2_pkg.get("lottery_names", []))
-        
-        # Combine or fallback to common set
         all_lotteries = sorted(list(kl1_lotteries | kled2_lotteries))
         if not all_lotteries:
-            # Default known Kerala Lottery list from training dataset
             all_lotteries = [
                 'Akshaya', 'Bhagyanidhi', 'Bhagyathara', 'Dhanalekshmi',
                 'Fifty-Fifty', 'Karunya', 'Karunya Plus', 'Nirmal',
@@ -215,13 +394,26 @@ class ModelService:
             ]
         self.lottery_names = all_lotteries
         self._is_loaded = True
-        print(f"[ModelService] Models successfully loaded. Valid lotteries ({len(self.lottery_names)}): {self.lottery_names}")
+
+        elapsed = time.time() - self._diagnostics["load_start"]
+        self._diagnostics["load_time_s"] = round(elapsed, 1)
+        self._diagnostics["kl1_models_count"] = len(self.kl1_pkg["models"])
+        self._diagnostics["kled2_models_count"] = len(self.kled2_pkg["models"])
+        self._diagnostics["lotteries_count"] = len(self.lottery_names)
+
+        print(
+            f"[ModelService] Models loaded successfully in {elapsed:.1f}s. "
+            f"KL1 pipelines: {len(self.kl1_pkg['models'])}, "
+            f"KLED2 pipelines: {len(self.kled2_pkg['models'])}, "
+            f"Lotteries ({len(self.lottery_names)}): {self.lottery_names}"
+        )
+        print(f"[ModelService] Disk at end: {_disk_space_info('/tmp')}")
 
     def validate_lottery(self, lottery: str) -> str:
         """Validates and canonicalizes lottery name against model training classes."""
         if not self._is_loaded:
             self.load_models()
-        
+
         for name in self.lottery_names:
             if name.lower() == lottery.strip().lower():
                 return name
@@ -255,7 +447,7 @@ class ModelService:
     def build_kled2_features(self, date_str: str, lottery: str) -> pd.DataFrame:
         """Exact original KLED2 cyclical date feature engineering."""
         year, month, day, weekday, day_of_year = self.extract_date_components(date_str)
-        
+
         month_sin = float(np.sin(2.0 * np.pi * month / 12.0))
         month_cos = float(np.cos(2.0 * np.pi * month / 12.0))
         weekday_sin = float(np.sin(2.0 * np.pi * weekday / 7.0))

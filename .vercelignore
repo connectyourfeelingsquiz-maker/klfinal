@@ -1,6 +1,9 @@
 # Vercel deployment ignore file for Python Backend
 frontend/
 node_modules/
+models/
+*.joblib
+*.pkl
 .git/
 final.csv
 __pycache__/
